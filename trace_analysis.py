@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 
 import argparse
+from collections import deque
 import copy
 import ctypes
+import itertools
 import os
 import re
 import time
@@ -536,7 +538,7 @@ def longest_nonoverlapping_repeats(program):
                     if current.start + strlen <= next.start:
                         current = next
                         count += 1
-                node.num_repeats = count
+                node.num_repeats = count + 1
     tree.pre_order(finder)
 
     # This ordering heuristic is approximating tandem repeats?
@@ -570,31 +572,553 @@ def find_repeat_candidates(program, alg):
         assert(False)
 
 
+class TraceProcessor:
+    # TODO (rohany): Adjust the signature here.
+    def process_operation(self, op: Operation):
+        assert(False)
+
+
+# TODO (rohany): Add in a tiered trace identification algorithm.
+class BatchedTraceProcessor(TraceProcessor):
+    def __init__(self, prog, batchsize):
+        self.batch = []
+        self.batchsize = batchsize
+        self.hashed_prog = [hash(op) for op in prog]
+        self.opidx = -1
+
+    def process_operation(self, op: Operation):
+        self.opidx += 1
+        self.batch.append(op)
+        if len(self.batch) == self.batchsize:
+            # TODO (rohany): Adjust this analysis to return some set of potential potential traces
+            #  that don't overlap with each other. This is pretty critical, as we can't decide
+            #  to record a trace while already recording one!
+            repeats = find_repeat_candidates(self.batch, RepeatAlgorithms.LONGEST_NONOVERLAPPING_REPEAT)
+
+            def startswith(l1, l2):
+                for i1, i2 in zip(l1, l2):
+                    if i1 != i2:
+                        return False
+                return True
+
+            def anyprefix(l, ls):
+                for l2 in ls:
+                    if startswith(l, l2):
+                        return True
+                return False
+
+            def hashall(l):
+                return [hash(x) for x in l]
+
+            # TODO (rohany): I think that this isn't the right place for this / the better
+            #  place to do this is inside the trie itself. Don't accept insertions that are
+            #  prefixes of anything else already in the trace. However, this is fine for now,
+            #  as it seems to be working.
+            # TODO (rohany): Report the top N traces that don't overlap with each other.
+            # TODO (rohany): I don't know yet if the overlapping business is the
+            #  right thing or not?
+            to_return = []
+            hashed_to_return = []
+            for repeat in repeats:
+                trace = self.batch[repeat.start:repeat.end]
+                if anyprefix(hashall(trace), hashed_to_return):
+                    continue
+                to_return.append(trace)
+                hashed_to_return.append(hashall(trace))
+
+            # if len(repeats) != 0:
+            #     best = repeats[0]
+            #     S = self.hashed_prog
+            #     start, end = best.start, best.end
+            #     trace = tuple([hash(op) for op in self.batch][start:end])
+            #     count = 0
+            #     lastmatch = None
+            #     for j in range(self.opidx, len(S)):
+            #         if trace == tuple(S[j:j+(end-start)]) and (lastmatch is None or (j - lastmatch >= len(trace))):
+            #             count += 1
+            #             lastmatch = j
+            #     print(f"Found repeat at operation index: {self.opidx}: repeatlen={best.end-best.start}, num_repeats={best.num_repeats}, full total matches={count}")
+            self.batch = []
+            return to_return
+        return None
+
+
+# Another component of the trace cache architecture is a component that actually
+# sees when repeated substrings are occurring before it tries to memoize them.
+# This component needs to:
+# 1) maintain a set of current "potential" traces, i.e. traces returned from
+#    the trace identification component.
+# 2) as operations are being processed, maintain counts of what traces are
+#    actually getting hit by the program.
+# 3) after some number of operations have been processed, or a trace in the
+#    counter has reached a threshold value, report the counts of all traces
+#    that are being maintained.
+# 4) The traces identified by the repeat-based algorithm and then verified
+#    by this component can now be recorded if seen again.
+# This component could be implemented in the following manner:
+# 1) Maintain a trie built out of all potential traces T_1, ... T_n. In the real
+#    implementation, we can use a radix tree.
+# 2) Maintain a set of "active trie pointers".
+# 3) As each operation is encountered, advance all potential trie pointers
+#    if possible. Remove any that are not possible to advance. Add in a pointer
+#    for the current operation.
+# 4) If a pointer ever makes it to the bottom of the trie, increment the pointer
+#    for that string.
+
+class TrieNode:
+    def __init__(self, token):
+        self.token = token
+        self.is_end = False
+        self.children = {}
+        self.num_visits = 0
+        self.opidx = None
+
+    def print(self):
+        print("Parent: ", self, self.token, self.children)
+        for child in self.children.values():
+            child.print()
+
+    def empty(self) -> bool:
+        return len(self.children) == 0
+
+
+class Trie:
+    def __init__(self):
+        self.root = TrieNode(None)
+
+    def insert(self, string, opidx):
+        node = self.root
+
+        for token in string:
+            if token in node.children:
+                node = node.children[token]
+            else:
+                new_node = TrieNode(token)
+                node.children[token] = new_node
+                node = new_node
+
+        node.is_end = True
+        # TODO (rohany): Are we changing opidx accidentally here?
+        assert node.opidx is None
+        node.opidx = opidx
+
+    def contains(self, string):
+        node = self.root
+
+        for token in string:
+            if token in node.children:
+                node = node.children[token]
+            else:
+                return False
+
+        return node.is_end
+
+    def remove(self, string):
+        def recur(node, idx):
+            if idx == len(string):
+                node.is_end = False
+                if node.empty():
+                    return None
+                else:
+                    return node
+            else:
+                # TODO (rohany): Let's just assume that we'll only call
+                #  delete on strings that were actually inserted into the trie.
+                token = string[idx]
+                child = recur(node.children[token], idx+1)
+                if child is None:
+                    del node.children[token]
+                else:
+                    node.children[token] = child
+                if not node.is_end and node.empty():
+                    return None
+                else:
+                    return node
+        recur(self.root, 0)
+
+    def foreach_string(self, f):
+        def recur(node, prefix):
+            local = prefix.copy()
+            if node.token is not None:
+                local.append(node.token)
+            if node.is_end:
+                f(local, node)
+            for child in node.children.values():
+                recur(child, local)
+
+        recur(self.root, [])
+
+    def print(self):
+        self.root.print()
+
+
+class TraceTriePointer:
+    def __init__(self, node: TrieNode, opidx: int, threshold = None):
+        self.node = node
+        self.opidx = opidx
+        self.tokens = []
+        self.threshold = threshold
+        self.threshold_idx = None
+        self.depth = 0
+
+    def advance(self, token) -> bool:
+        # Importantly, we can't check node.is_end here, because if
+        # a trie node is a prefix of another string in the trie, we'd
+        # break off here when we should keep searching.
+        if token not in self.node.children:
+            return False
+        self.node = self.node.children[token]
+        self.tokens.append(token)
+        self.depth += 1
+        return True
+
+    def complete(self):
+        if self.node.is_end and self.opidx >= self.node.opidx:
+            self.node.num_visits += 1
+            if self.threshold is not None and self.node.num_visits >= self.threshold:
+                assert(len(self.tokens) == self.depth)
+                return self.tokens, self.opidx
+        return None
+
+
+
+# Notes for future Rohan:
+# We'll likely want to have a data structure like this to maintain
+# all of the traces we have that we are either trying to actively
+# record or replay. Since that data structure will have active traverals
+# through it while we are potentially adding or removing new traces
+# to or from it, we don't want to mess up those existing traversals.
+# Something that we can do is have an "age" on each end string, which is
+# the operation index at which that trace was first entered into the
+# data structure. Then matches only occur if an end node was reached with
+# an operation index less than or equal to the operation index that the
+# traversal pointer was created with.
+class TraceOccurrenceWatcher:
+    def __init__(self, threshold=None):
+        self.trie = Trie()
+        self.active_pointers = set()
+        self.threshold = threshold
+        self.count = 0
+
+    def insert(self, trace, opidx):
+        self.trie.insert(trace, opidx)
+        self.count += 1
+
+    def remove(self, trace):
+        # TODO (rohany): The remove call here isn't checking that the string actually
+        #  exists within the data structure, so the count operation is not correct if
+        #  that assertion doesn't hold.
+        self.trie.remove(trace)
+        self.count -= 1
+
+    def process_operation(self, token, opidx):
+        to_remove = []
+        thresholded = []
+        for pointer in self.active_pointers:
+            if not pointer.advance(token):
+                to_remove.append(pointer)
+                continue
+            completed = pointer.complete()
+            if completed is not None:
+                thresholded.append(completed)
+        for pointer in to_remove:
+            self.active_pointers.remove(pointer)
+        root = self.trie.root
+        if token in root.children:
+            self.active_pointers.add(TraceTriePointer(root.children[token], opidx, self.threshold))
+        return thresholded
+
+
+# TODO (rohany): I'm imagining another kind of TrieWatcher that can be used for us to
+#  determine when we should insert a trace record operation into the stream.
+#  At a high level, we buffer operations ourselves into a local buffer before issuing
+#  them through the Legion pipeline. In front of the Legion pipeline, we have a kind
+#  of trace watcher that maintains active pointers into the trie for our buffer. Then,
+#  our trace watcher advances trie pointers in order of operation index. Then, as soon as
+#  pointer at index `i` has no potential matches, the buffer is flushed up until index i
+#  through to the earliest possible index held by trie pointer with index > i. This flushes
+#  as much through the pipeline as possible as soon as a trace is not possible to be matched.
+#
+#  This approach though has a issue with tries that have prefixes of strings inside the trie.
+#  I think the cleanest thing is to not allow prefixes, and just have the traces we have
+#  recorded / accepted not have prefixes? Because otherwise there's a problem of seeing a
+#  prefix so far that matches a trace, should you keep waiting for the rest or not?
+
+# What I'm stuck on right now is the question of a trace being a substring (not necessarily a prefix)
+# of another trace in the trie. The prefix problem was one such symptom of it that I ruled out,
+# but substrings might also be an issue. I can either complicate the data structure to handle them,
+# or define them away. It might be better to just handle them?
+# The problem is that it's not just the "deepest" trace that we want to check for completion
+# at each new processed operation. Consider the operation stream ABABCDCDABAB, where we are
+# watching for the traces ABABCDCDABAB and CDCD. After processing ABABACDCD, we'd have a pointer
+# at ABABCDCD, and a pointer at CDCD that is complete. Depending on what we see next, we might
+# consider to continue going with ABABCDCDABAB, or just ship the ABAB untraced, ship CDCD traced.
+# However, if we have ABAB as a trace as well, then we also might consider just doing ABAB?
+#
+# I think prefixes and substrings have different complexities. Prefixes likely complicate the
+# invariants of the data structure I have in my head.
+#
+# Spitballing here, I think that the structure should maintain the following things:
+# 1) a buffer of pending operations
+# 2) a list/set of active pointers into the trie (sorted by depth?)
+# 3) a list/set of "completed" pointers in the trie (sorted by depth?)
+#
+# I think we want to make the heuristic to favor longer traces whenever possible.
+# So whenever we see a new token, we advance all active pointers, then see if any
+# have completed. If any have completed, add them to the completed set.
+# Next, update the op buffer -- flush any operations deeper in the buffer than the
+# deepest completed or active pointer.
+# Then, compare the set of completed pointers to the set of active pointers.
+# If there are any active pointers deeper than the depths of the completed pointers,
+# keep going. If there are any completed pointers deeper than active pointers, launch
+# the trace corresponding to the deepest one, flush the buffer up to that point, and
+# remove all active pointers and completed pointers.
+#
+# Correction to above. "Depth" is not necessarily the right ordering metric, or not
+# by itself. We want "opidx" and "depth". The "opidx" difference between the active
+# pointers tells us exactly how many operations we can issue before stepping on
+# some other pointer's toes.
+#
+# I think that we can handle prefixes by maintaining an interval-tree like data structure.
+# I don't want to do this yet until we have to, because of this extra cost.
+
+class TraceReplayTrieWatcher:
+    def __init__(self):
+        # TODO (rohany): I think that this would be like a std::list, rather than a vector.
+        self.op_buffer = []
+        # The starting index in the operation stream that this buffer corresponds to. It
+        # will be advanced once operations are flushed to the "runtime".
+        self.op_buf_start_idx = 0
+        # These are ordered by depth.
+        self.active_watchers = []
+        self.completed_watchers = []
+        self.trie = Trie()
+
+    def process_operation(self, token, opidx):
+        self.op_buffer.append(token)
+        # TODO (rohany): Hack setting threshold for the TraceTriePointer so that it
+        #  actually returns something if complete succeeds.
+        self.active_watchers.append(TraceTriePointer(self.trie.root, opidx, threshold=0))
+
+        advanced_pointers = []
+        completed_pointers = []
+        for pointer in self.active_watchers:
+            if pointer.advance(token):
+                # Depending on if the pointer is complete, add it to the right list.
+                # Different logic will need to be used if we want to support prefixes.
+                if pointer.complete() is not None:
+                    completed_pointers.append(pointer)
+                else:
+                    advanced_pointers.append(pointer)
+
+
+        earliest_active = min([pointer.opidx for pointer in advanced_pointers], default=None)
+        earliest_completed = min([pointer.opidx for pointer in completed_pointers], default=None)
+        earliest_opidx = min([pointer.opidx for pointer in itertools.chain(advanced_pointers, completed_pointers)], default=None)
+
+        # print("active", len(advanced_pointers), "completed", len(completed_pointers), "earliest active", earliest_active, "earliest completed", earliest_completed, "earliest opidx", earliest_opidx, "op buf start idx", self.op_buf_start_idx, "op buffer", self.op_buffer)
+
+        # No matter what, we can flush all operations before the earliest active or completed pointer.
+        # Note that if there are no active pointers or completed pointers, min will be None, flushing
+        # the entire buffer. This will change if we want to support prefixes.
+        self._flush_buffer(earliest_opidx)
+
+        if earliest_active is None and earliest_completed is None:
+            # If we have no active or completed pointers, then there isn't
+            # anything left to do.
+            pass
+        elif earliest_active is None:
+            # In this case, we only have completed pointers and no active pointers.
+            # So, flush through as many completed operations as we can. This is heuristic
+            # to try and issue the largest traces possible. There are potentially other
+            # kinds of orderings that could be done here, like a binpack of the depths
+            # and starting indices, but I don't think this situation should arise that often anyway?
+            sorted_completions = reversed(sorted(completed_pointers, key=lambda pointer: pointer.depth))
+            for completed in sorted_completions:
+                if completed.opidx < self.op_buf_start_idx:
+                    continue
+                self._flush_buffer(completed.opidx)
+                print(f"ISSUING TRACE OF LENGTH {completed.depth} recorded at opidx {completed.node.opidx}")
+                self._flush_buffer(completed.opidx + completed.depth)
+
+            # At this point we've issued all of the possible completed pointers, with no active
+            # pointers left in the trie, so issue the rest of the buffer now.
+            self._flush_buffer()
+            completed_pointers = []
+        elif earliest_completed is None:
+            # There are no completed pointers, so all there's left to do issue everything
+            # that is unmatched now. We can do this by finding the smallest active opidx
+            # and flushing the buffer until then. This was also done outside of this case above.
+            ...
+        else:
+            # In the final case, we have completions and active pointers. First, flush
+            # through operations farther behind the earlier active or completed pointer,
+            # which was done above. Next, if there are completed pointers earlier than
+            # active pointers, flush those completed pointers and remove any of the
+            # active pointers that are no longer valid.
+            if earliest_completed < earliest_active:
+                sorted_completions = sorted(completed_pointers, key=lambda pointer: pointer.opidx)
+                cutoff_opidx = earliest_active
+                for i, completed in enumerate(sorted_completions):
+                    if completed.opidx >= cutoff_opidx:
+                        completed_pointers = completed_pointers[i:]
+                        break
+                    if completed.opidx < self.op_buf_start_idx:
+                        continue
+                    self._flush_buffer(completed.opidx)
+                    print(f"ISSUING TRACE OF LENGTH {completed.depth} recorded at opidx {completed.node.opidx}")
+                    self._flush_buffer(completed.opidx + completed.depth)
+                # Remove any invalid advanced pointers now.
+                new_advanced_pointers = []
+                for pointer in advanced_pointers:
+                    if pointer.opidx >= self.op_buf_start_idx:
+                        new_advanced_pointers.append(pointer)
+                advanced_pointers = new_advanced_pointers
+            elif earliest_completed > earliest_active:
+                # If there are active pointers earlier than completed pointers,
+                # then there's nothing left to do. In this approach, we are heuristically
+                # favoring longer traces over shorter ones.
+                ...
+            else:
+                assert False
+
+        self.active_watchers = advanced_pointers
+        self.completed_watchers = completed_pointers
+
+    def insert(self, trace, opidx):
+        self.trie.insert(trace, opidx)
+
+    # TODO (rohany): We won't worry about removals for now.
+
+    def _flush_buffer(self, opidx=None):
+        if opidx is None:
+            self.op_buf_start_idx += len(self.op_buffer)
+            self.op_buffer = []
+            return
+        if self.op_buf_start_idx > opidx:
+            return
+        real_index = opidx - self.op_buf_start_idx
+        self.op_buffer = self.op_buffer[real_index:]
+        self.op_buf_start_idx += real_index
+
+
+
+
 def main(filename):
+
+    # watcher = TraceReplayTrieWatcher()
+    # traces = ["ABABCDCD", "CDCD", "BABACDCDA"]
+    # for idx, s in enumerate(traces):
+    #     watcher.insert(s, idx)
+    #
+    # for idx, tok in enumerate("CDCDABABABABCDCDABABCDCD"):
+    #     watcher.process_operation(tok, idx + len(traces))
+    #
+    # exit(0)
+
+    # def p(s, node):
+    #     print(s, node.num_visits)
+    # watcher = Trie()
+    # for s in ["ABCD", "DEF", "ABC"]:
+    #     watcher.insert(s, 0)
+    #
+    # watcher.remove("DEF")
+    # watcher.remove("ABCD")
+    # watcher.remove("ABC")
+    #
+    # watcher.foreach_string(p)
+    #
+    # # for c in "ABCABCDEFABCDABCDABCDEFDEF":
+    # #     watcher.process_operation(c)
+    # # def p(s, node):
+    # #     print(s, node.num_visits)
+    # # watcher.trie.foreach_string(p)
+    # exit(0)
+
+
     print("Loading file...")
     with open(filename, 'r') as f:
         state = parse_spy_log(f)
     state.prune_ops()
     print(f"Loaded Legion Spy log, {len(state.prog)} ops")
 
-    t = time.time()
-    best = find_repeat_candidates(state.prog, RepeatAlgorithms.LONGEST_NONOVERLAPPING_REPEAT)[0]
-    print("compute time: ", time.time() - t)
-
     S = [hash(op) for op in state.prog]
-    op1 = tuple(S[best.start:best.end])
 
-    print(f"RepeatLen={len(op1)}")
-    count = 0
-    lastmatch = None
-    for i in range(best.end, len(state.prog)):
-        if op1 == tuple(S[i:i+(best.end-best.start)]):
-            print("Matched at index: ", i)
-            count += 1
-            if lastmatch is not None:
-                assert(i - lastmatch >= len(op1))
-            lastmatch = i
-    print(f"Total matched: {count}")
+    # We can change this execution model here to maintain buffers etc like what
+    # I might implement in the runtime system.
+
+    def p(s, node):
+        print(node.num_visits, s[:5], len(s), node.opidx)
+
+    # TODO (rohany): What are the actual interfaces that I want to expose here?
+    #  1) TraceProcessor -- a component that processes a stream an operation at a time,
+    #     and maybe returns a list of traces to start considering.
+    #  2) TraceWatcher -- a component that ingests traces from the TraceProcessor and watches
+    #     the operation stream to decide when to start recording a trace.
+    #  3) ActiveTraceManager -- a component that maintains traces committed to by the
+    #     TraceWatcher and tracks how many times they have been hit by the application,
+    #     essentially seeing the results of the decisions we have made.
+
+    to_add = 10
+    # to_remove = 5
+    visit_threshold = 5
+    maximum_watching = 25
+
+    # Let's see how many operations are needed to be seen at once to identify our good repeat.
+    processor = BatchedTraceProcessor(state.prog, 300)
+    # processor = BatchedTraceProcessor(state.prog, 2000)
+    watcher = TraceOccurrenceWatcher(threshold=visit_threshold)
+    # committed = TraceOccurrenceWatcher()
+    committed = TraceReplayTrieWatcher()
+    for opidx, op in enumerate(state.prog):
+
+        for trace, idx in watcher.process_operation(hash(op), opidx):
+            if not committed.trie.contains(trace):
+                committed.insert(trace, idx)
+        committed.process_operation(hash(op), opidx)
+
+        traces = processor.process_operation(op)
+        if traces is not None:
+            if watcher.count + to_add > maximum_watching:
+                # Remove potential traces with the fewest number of visits.
+                all_traces = []
+                def add_trace(s, node):
+                    all_traces.append((s, node.num_visits))
+                watcher.trie.foreach_string(add_trace)
+                for trace, _ in sorted(all_traces, key=lambda x: x[1])[:(watcher.count + to_add - maximum_watching)]:
+                    watcher.remove(trace)
+
+            for trace in [[hash(op) for op in trace] for trace in traces[:to_add]]:
+                if not watcher.trie.contains(trace):
+                    watcher.insert(trace, opidx)
+
+    print("Final committed traces:")
+    committed.trie.foreach_string(p)
+    # print("Final watcher traces:")
+    # watcher.trie.foreach_string(p)
+
+    # t = time.time()
+    # candidates = find_repeat_candidates(state.prog, RepeatAlgorithms.LONGEST_NONOVERLAPPING_REPEAT)
+    # print("compute time: ", time.time() - t)
+    #
+    # for candidate in candidates:
+    #     print(candidate.end - candidate.start, candidate.num_repeats)
+    #
+    # best = candidates[0]
+    #
+    # op1 = tuple(S[best.start:best.end])
+    #
+    # print(f"BEST RepeatLen={len(op1)}")
+    # count = 0
+    # lastmatch = None
+    # for i in range(best.end, len(state.prog)):
+    #     if op1 == tuple(S[i:i+(best.end-best.start)]):
+    #         print("Matched at index: ", i)
+    #         count += 1
+    #         if lastmatch is not None:
+    #             assert(i - lastmatch >= len(op1))
+    #         lastmatch = i
+    # print(f"Total matched: {count}")
 
     #
     # op2 = state.prog[best.end:best.end + (best.end-best.start)]
