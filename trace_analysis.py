@@ -1283,7 +1283,7 @@ class TraceReplayTrieWatcher:
 
 
 
-def main(filename):
+def main(filename, winnowed):
 
     # winnower = Winnower(10, 4)
     # for tok in "adorunrunrunadorunrun":
@@ -1356,15 +1356,14 @@ def main(filename):
     visit_threshold = 15
     maximum_watching = 25
 
-    # Let's see how many operations are needed to be seen at once to identify our good repeat.
-    # processor = BatchedTraceProcessor(state.prog, 300)
-    # processor = WinnowingTraceProcessor(300)
     # It looks like the winnowing batched processor is strictly better than the
     # winnowing-only processor.
-    processor = WinnowingBatchedTraceProcessor(300)
-    # processor = BatchedTraceProcessor(state.prog, 2000)
+    if winnowed:
+        processor = WinnowingBatchedTraceProcessor(300)
+    else:
+        processor = BatchedTraceProcessor(state.prog, 300)
+
     watcher = TraceOccurrenceWatcher(threshold=visit_threshold)
-    # committed = TraceOccurrenceWatcher()
     committed = TraceReplayTrieWatcher()
     for opidx, op in enumerate(state.prog):
         for trace, idx in watcher.process_operation(hash(op), opidx):
@@ -1471,6 +1470,7 @@ def main(filename):
 
 parser = argparse.ArgumentParser()
 parser.add_argument("filename", type=str)
+parser.add_argument("--winnowed", default=False, action="store_true")
 args = parser.parse_args()
 
 if __name__ == "__main__":
