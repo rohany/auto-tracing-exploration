@@ -32,6 +32,8 @@ op_provenance_pat        = re.compile(
     prefix+"Operation Provenance (?P<uid>[0-9]+) (?P<provenance>.*)")
 
 
+TRACE_MIN_LENGTH = 3
+
 class LegionObject:
     def __init__(self, uid):
         self.uid = uid
@@ -618,13 +620,9 @@ class BatchedTraceProcessor(TraceProcessor):
             # TODO (rohany): I don't know yet if the overlapping business is the
             #  right thing or not?
             to_return = []
-            hashed_to_return = []
             for repeat in repeats:
                 trace = self.batch[repeat.start:repeat.end]
-                if anyprefix(hashall(trace), hashed_to_return):
-                    continue
                 to_return.append(trace)
-                hashed_to_return.append(hashall(trace))
 
             # if len(repeats) != 0:
             #     best = repeats[0]
@@ -638,7 +636,222 @@ class BatchedTraceProcessor(TraceProcessor):
             #             count += 1
             #             lastmatch = j
             #     print(f"Found repeat at operation index: {self.opidx}: repeatlen={best.end-best.start}, num_repeats={best.num_repeats}, full total matches={count}")
+
+            # TODO (rohany): This should be a circular buffer, rather than a "cleared" buffer?
             self.batch = []
+            return to_return
+        return None
+
+
+class RollingKGramHasher:
+    class HasherState(Enum):
+        INIT = 0
+        FULL = 1
+
+    def __init__(self, k):
+        self.k = k
+        # "base" = large random prime
+        self.b = 2452301417224347413
+        # The modulus is 2^64, as we'll let integers overflow. We have to
+        # manually do this in Python, but will overflow by default in C++.
+        self.p = 18446744073709551615
+        self.bk = 1
+        for i in range(1, k):
+            self.bk = (self.bk * self.b) % self.p
+        self.state = self.HasherState.INIT
+        self.curhash = 0
+        self.buf = [0] * self.k
+        self.idx = 0
+        self.seen = 0
+
+    def add_hash(self, hashval):
+        if self.state == self.HasherState.INIT:
+            self.buf[self.idx] = hashval
+            self.idx += 1
+            old = (self.curhash * self.b) % self.p
+            self.curhash = (old + hashval) % self.p
+            self.seen += 1
+            if self.seen == self.k:
+                self.state = self.HasherState.FULL
+                return self.curhash
+            return None
+        elif self.state == self.HasherState.FULL:
+            idx = self.idx % self.k
+            self.idx += 1
+            oldtok = self.buf[idx]
+            self.buf[idx] = hashval
+            sub = (oldtok * self.bk) % self.p
+            diff = (self.curhash - sub) % self.p
+            mul = (diff * self.b) % self.p
+            result = (mul + hashval) % self.p
+            self.curhash = result
+            return result
+        else:
+            assert(False)
+
+
+# Implementation taken from Figure 5 of http://theory.stanford.edu/~aiken/publications/papers/sigmod03.pdf.
+class Winnower:
+    def __init__(self, t, k):
+        self.t = t
+        self.k = k
+        self.w = t - k + 1
+        assert(self.w > 0)
+        # Circular buffer holding the windows.
+        self.h = [0] * self.w
+        self.r = 0
+        self.min = 0
+
+        self.hasher = RollingKGramHasher(k)
+        self.watches = {}
+
+        # TODO (rohany): Make this configurable.
+        self.threshold = 5
+
+        # Keeping the below thoughts around just for logging, but I don't
+        # think they are correct. We don't need to explicitly maintain
+        # the winnowed fingerprints themselves, all we need to maintain is
+        # either a hash table or a sketch of the fingerprints seen. In a different
+        # component we're actually going to maintain the hashes and the tasks
+        # themselves, so the purpose of this winnower is to just maintain an
+        # approximate count of each fingerprint, and report when a fingerprint
+        # has crossed a threshold. When it has crossed a threshold, we reset
+        # all of the counting state within the winnower, and notify the larger batch processing
+        # algorithm that it is time to find actual repeats.
+
+        # WRONG BELOW:
+        # How many fingerprints to track. In a standard application of
+        # winnowing, we would collect a set of fingerprints for the entire
+        # document. Since we are more interested in a stream
+        # self.fingerlen = fingerlen
+
+    def minfunc(self, a, b):
+        return a if self.lessfunc(a, b) else b
+
+    def lessfunc(self, a, b):
+        if a is None and b is None:
+            return False
+        if a is None and b is not None:
+            return True
+        if a is not None and b is None:
+            return False
+        return a < b
+
+    # TODO (rohany): I'm not sure what the overall interface will look
+    #  like here, as different "process_operation" objects are going
+    #  to want to return different kinds of data naturally, but for now
+    #  all this needs to do is to return to the caller whether the
+    #  larger buffer analysis needs to be done.
+    def process_operation(self, op: Operation) -> bool:
+        kgramhash = self.hasher.add_hash(hash(op))
+        # print(op, "KGRAMHASH:", kgramhash, self.hasher.buf)
+        if kgramhash is not None:
+            return self.process_hash(kgramhash)
+        return False
+
+    def process_hash(self, hashval):
+        self.r = (self.r + 1) % self.w
+        self.h[self.r] = hashval
+        if self.min == self.r:
+            i = (self.r - 1) % self.w
+            while i != self.r:
+                if self.lessfunc(self.h[i], self.h[self.min]):
+                    self.min = i
+                i = (i - 1 + self.w) % self.w
+            return self.record(self.h[self.min])
+        else:
+            # Right now, this implements what the authors call "robust winnowing". If
+            # we want "normal winnowing", then this needs to be a <=, rather than a <.
+            if self.lessfunc(self.h[self.r], self.h[self.min]):
+                self.min = self.r
+                return self.record(self.h[self.min])
+        return False
+
+    def record(self, hashval) -> bool:
+        # For now, or for a first implementation, we can just maintain a hash
+        # table of each fingerprint and its counts. The problem is that this
+        # data structure could increase to be the total number of elements in
+        # the stream. To handle that case (and use less memory), we could instead
+        # implement a streaming style algorithm (in particular the "lossy counting"
+        # algorithm described in https://www.vldb.org/conf/2002/S10P03.pdf, and
+        # explained better in https://www.cs.emory.edu/~cheung/Courses/584/Syllabus/07-Heavy/Manku.html.
+        count = self.watches.get(hashval, 0)
+        count += 1
+        self.watches[hashval] = count
+        return count > self.threshold
+
+    def reset(self):
+        self.watches = {}
+
+
+class WinnowingTraceProcessor(TraceProcessor):
+    class State(Enum):
+        BUF_INIT = 0
+        BUF_FULL = 1
+
+    def __init__(self, batchsize):
+        self.batch = [None] * batchsize
+        self.idx = 0
+        self.state = self.State.BUF_INIT
+        self.batchsize = batchsize
+        # TODO (rohany): play with these parameters later.
+        self.winnower = Winnower(10, 5)
+
+    def add_op(self, op: Operation):
+        self.batch[self.idx % self.batchsize] = op
+        self.idx += 1
+        if self.state == self.State.BUF_INIT and self.idx == self.batchsize:
+            self.state = self.State.BUF_FULL
+
+    def export_buf(self):
+        if self.state == self.State.BUF_INIT:
+            return self.batch[:self.idx]
+        else:
+            result = [None] * self.batchsize
+            for i in range(0, self.batchsize):
+                result[i] = self.batch[(self.idx + i) % self.batchsize]
+            return result
+
+    def process_operation(self, op: Operation):
+        self.add_op(op)
+        trigger = self.winnower.process_operation(op)
+        # print("TRIGGER VALUE: ", trigger)
+        # TODO (rohany): I'm not sure how to incorporate both the buffer and the
+        #  winnower here. I think something to do (in a separate class) is to have
+        #  a batched + triggered processor that starts a processing job if the trigger
+        #  is hit or if the buffer size is reached. In the case that the buffer size
+        #  has been reached, flush the buffer away.
+        if trigger:
+            self.winnower.reset()
+            batch = self.export_buf()
+            repeats = find_repeat_candidates(batch, RepeatAlgorithms.LONGEST_NONOVERLAPPING_REPEAT)
+            to_return = []
+            for repeat in repeats:
+                trace = batch[repeat.start:repeat.end]
+                to_return.append(trace)
+            return to_return
+        return None
+
+
+class WinnowingBatchedTraceProcessor(TraceProcessor):
+    def __init__(self, batchsize):
+        self.batch = []
+        self.batchsize = batchsize
+        # TODO (rohany): play with these parameters later.
+        self.winnower = Winnower(10, 5)
+
+    def process_operation(self, op: Operation):
+        self.batch.append(op)
+        trigger = self.winnower.process_operation(op)
+        if trigger or len(self.batch) == self.batchsize:
+            batch = self.batch
+            self.winnower.reset()
+            self.batch = []
+            repeats = find_repeat_candidates(batch, RepeatAlgorithms.LONGEST_NONOVERLAPPING_REPEAT)
+            to_return = []
+            for repeat in repeats:
+                trace = batch[repeat.start:repeat.end]
+                to_return.append(trace)
             return to_return
         return None
 
@@ -697,10 +910,40 @@ class Trie:
                 node.children[token] = new_node
                 node = new_node
 
-        node.is_end = True
-        # TODO (rohany): Are we changing opidx accidentally here?
         assert node.opidx is None
+        assert not node.is_end
+        node.is_end = True
         node.opidx = opidx
+
+        # self.check_invariants()
+
+    def prefix(self, string):
+        node = self.root
+
+        for token in string:
+            if token in node.children:
+                node = node.children[token]
+            else:
+                return False
+
+        return True
+
+    def superstring(self, string):
+        node = self.root
+
+        index = 0
+        while index < len(string):
+            token = string[index]
+            if token in node.children:
+                node = node.children[token]
+            else:
+                break
+            index += 1
+
+        if node == self.root:
+            return False
+
+        return (index < len(string)) and node.is_end
 
     def contains(self, string):
         node = self.root
@@ -751,6 +994,18 @@ class Trie:
     def print(self):
         self.root.print()
 
+    def check_invariants(self):
+        # Only nodes that are ends of strings can have opidx set.
+        def endopidx(node):
+            if node.is_end and node.opidx is None:
+                assert False
+            if not node.is_end and node.opidx is not None:
+                assert False
+            for child in node.children.values():
+                endopidx(child)
+        endopidx(self.root)
+        # ...
+
 
 class TraceTriePointer:
     def __init__(self, node: TrieNode, opidx: int, threshold = None):
@@ -793,14 +1048,19 @@ class TraceTriePointer:
 # data structure. Then matches only occur if an end node was reached with
 # an operation index less than or equal to the operation index that the
 # traversal pointer was created with.
+#
+# There is a question about if I want to make the trace TraceOccurreenceWatcher
+# act more like the TraceReplayWatcher, where I don't consider two traces as "seen"
+# if the consumption of one means that I don't see the second.
 class TraceOccurrenceWatcher:
     def __init__(self, threshold=None):
         self.trie = Trie()
-        self.active_pointers = set()
+        self.active_pointers = []
         self.threshold = threshold
         self.count = 0
 
     def insert(self, trace, opidx):
+        assert(len(trace) >= TRACE_MIN_LENGTH)
         self.trie.insert(trace, opidx)
         self.count += 1
 
@@ -812,20 +1072,17 @@ class TraceOccurrenceWatcher:
         self.count -= 1
 
     def process_operation(self, token, opidx):
-        to_remove = []
+        self.active_pointers.append(TraceTriePointer(self.trie.root, opidx, self.threshold))
+        new_pointers = []
         thresholded = []
         for pointer in self.active_pointers:
             if not pointer.advance(token):
-                to_remove.append(pointer)
                 continue
+            new_pointers.append(pointer)
             completed = pointer.complete()
             if completed is not None:
                 thresholded.append(completed)
-        for pointer in to_remove:
-            self.active_pointers.remove(pointer)
-        root = self.trie.root
-        if token in root.children:
-            self.active_pointers.add(TraceTriePointer(root.children[token], opidx, self.threshold))
+        self.active_pointers = new_pointers
         return thresholded
 
 
@@ -938,7 +1195,7 @@ class TraceReplayTrieWatcher:
                 if completed.opidx < self.op_buf_start_idx:
                     continue
                 self._flush_buffer(completed.opidx)
-                print(f"ISSUING TRACE OF LENGTH {completed.depth} recorded at opidx {completed.node.opidx}")
+                print(f"1 ISSUING TRACE OF LENGTH {completed.depth} recorded at opidx {completed.node.opidx}, issuing at {opidx}")
                 self._flush_buffer(completed.opidx + completed.depth)
 
             # At this point we've issued all of the possible completed pointers, with no active
@@ -952,22 +1209,44 @@ class TraceReplayTrieWatcher:
             ...
         else:
             # In the final case, we have completions and active pointers. First, flush
-            # through operations farther behind the earlier active or completed pointer,
+            # through operations farther behind the earliest active or completed pointer,
             # which was done above. Next, if there are completed pointers earlier than
             # active pointers, flush those completed pointers and remove any of the
             # active pointers that are no longer valid.
             if earliest_completed < earliest_active:
-                sorted_completions = sorted(completed_pointers, key=lambda pointer: pointer.opidx)
+                # TODO (rohany): An idea here is that once we have traces recorded and replayed,
+                #  we should prefer replaying them versus trying out some new traces (this is an
+                #  exploration vs exploitation tradeoff I'm choosing to not make right now). If
+                #  we order by visits and opidx, we can avoid randomly taking a long trace that
+                #  hasn't been seen much before over a trace we already have recorded and ready.
+                #  If this is done, the `completed_pointers` list needs to be updated without
+                #  a slice but instead a full filter about everything that is no longer valid.
+                #  We also have to make sure that whatever is chosen is before the cutoff point.
+                sorted_completions = sorted(completed_pointers, key=lambda pointer: (-pointer.node.num_visits, pointer.opidx))
+                # sorted_completions = sorted(completed_pointers, key=lambda pointer: pointer.opidx)
                 cutoff_opidx = earliest_active
-                for i, completed in enumerate(sorted_completions):
+                new_completions = []
+                for completed in sorted_completions:
                     if completed.opidx >= cutoff_opidx:
-                        completed_pointers = completed_pointers[i:]
-                        break
+                        new_completions.append(completed)
                     if completed.opidx < self.op_buf_start_idx:
                         continue
                     self._flush_buffer(completed.opidx)
-                    print(f"ISSUING TRACE OF LENGTH {completed.depth} recorded at opidx {completed.node.opidx}")
+                    print(f"2 ISSUING TRACE OF LENGTH {completed.depth} recorded at opidx {completed.node.opidx}, issuing at {opidx}")
                     self._flush_buffer(completed.opidx + completed.depth)
+                completed_pointers = new_completions
+
+                # cutoff_opidx = earliest_active
+                # for i, completed in enumerate(sorted_completions):
+                #     if completed.opidx >= cutoff_opidx:
+                #         print("BREAKING HERE?")
+                #         completed_pointers = completed_pointers[i:]
+                #         break
+                #     if completed.opidx < self.op_buf_start_idx:
+                #         continue
+                #     self._flush_buffer(completed.opidx)
+                #     print(f"2 ISSUING TRACE OF LENGTH {completed.depth} recorded at opidx {completed.node.opidx}, issuing at {opidx}")
+                #     self._flush_buffer(completed.opidx + completed.depth)
                 # Remove any invalid advanced pointers now.
                 new_advanced_pointers = []
                 for pointer in advanced_pointers:
@@ -1006,6 +1285,11 @@ class TraceReplayTrieWatcher:
 
 def main(filename):
 
+    # winnower = Winnower(10, 4)
+    # for tok in "adorunrunrunadorunrun":
+    #     winnower.process_operation(tok)
+    # exit(0)
+
     # watcher = TraceReplayTrieWatcher()
     # traces = ["ABABCDCD", "CDCD", "BABACDCDA"]
     # for idx, s in enumerate(traces):
@@ -1014,6 +1298,12 @@ def main(filename):
     # for idx, tok in enumerate("CDCDABABABABCDCDABABCDCD"):
     #     watcher.process_operation(tok, idx + len(traces))
     #
+    # exit(0)
+
+    # watcher = Trie()
+    # for s in ["ABCD", "ABY", "AZ"]:
+    #     watcher.insert(s, 0)
+    # print(watcher.superstring("AZ"))
     # exit(0)
 
     # def p(s, node):
@@ -1048,7 +1338,7 @@ def main(filename):
     # I might implement in the runtime system.
 
     def p(s, node):
-        print(node.num_visits, s[:5], len(s), node.opidx)
+        print(node.num_visits, s[:10], len(s), node.opidx)
 
     # TODO (rohany): What are the actual interfaces that I want to expose here?
     #  1) TraceProcessor -- a component that processes a stream an operation at a time,
@@ -1061,19 +1351,29 @@ def main(filename):
 
     to_add = 10
     # to_remove = 5
-    visit_threshold = 5
+    # Low visit thresholds (like 5) seem to result in traces we don't actually care about
+    # getting comitted.
+    visit_threshold = 15
     maximum_watching = 25
 
     # Let's see how many operations are needed to be seen at once to identify our good repeat.
-    processor = BatchedTraceProcessor(state.prog, 300)
+    # processor = BatchedTraceProcessor(state.prog, 300)
+    # processor = WinnowingTraceProcessor(300)
+    # It looks like the winnowing batched processor is strictly better than the
+    # winnowing-only processor.
+    processor = WinnowingBatchedTraceProcessor(300)
     # processor = BatchedTraceProcessor(state.prog, 2000)
     watcher = TraceOccurrenceWatcher(threshold=visit_threshold)
     # committed = TraceOccurrenceWatcher()
     committed = TraceReplayTrieWatcher()
     for opidx, op in enumerate(state.prog):
-
         for trace, idx in watcher.process_operation(hash(op), opidx):
-            if not committed.trie.contains(trace):
+            assert(len(trace) >= TRACE_MIN_LENGTH)
+            # TODO (rohany): I haven't yet thought of the cleanest way to check this, but I also
+            #  don't want to insert something if it is a superstring of a trace that
+            #  is already in the tree, because then we have a prefix situation?
+            # if not committed.trie.prefix(trace) and not committed.trie.superstring(trace):
+            if not committed.trie.prefix(trace):
                 committed.insert(trace, idx)
         committed.process_operation(hash(op), opidx)
 
@@ -1088,12 +1388,25 @@ def main(filename):
                 for trace, _ in sorted(all_traces, key=lambda x: x[1])[:(watcher.count + to_add - maximum_watching)]:
                     watcher.remove(trace)
 
-            for trace in [[hash(op) for op in trace] for trace in traces[:to_add]]:
-                if not watcher.trie.contains(trace):
+            # TODO (rohany): Insertions should go before the deletions ... Though I guess I did
+            #  this originally so that we wouldn't just delete the things we add immediately because
+            #  they have 0 count?
+            count = 0
+            for trace in [[hash(op) for op in trace] for trace in traces]:
+                if len(trace) < TRACE_MIN_LENGTH:
+                    continue
+                assert (len(trace) >= TRACE_MIN_LENGTH)
+                # if not watcher.trie.prefix(trace) and not watcher.trie.superstring(trace):
+                if not watcher.trie.prefix(trace):
                     watcher.insert(trace, opidx)
+                    count += 1
+                    if count == to_add:
+                        break
 
     print("Final committed traces:")
     committed.trie.foreach_string(p)
+
+    assert (committed.op_buf_start_idx + len(committed.op_buffer) == len(state.prog))
     # print("Final watcher traces:")
     # watcher.trie.foreach_string(p)
 
