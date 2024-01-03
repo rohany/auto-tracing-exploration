@@ -491,6 +491,7 @@ def naivetrepeats(s):
 
 
 def longest_nonoverlapping_repeats(program):
+    # Potential suffix tree implementation for C++ -- https://github.com/murraycu/murrayc-suffix-tree.
     tree = Tree({"prog": [hash(op) for op in program]})
 
     # First, for each node in the suffix tree, calculate all of
@@ -588,6 +589,9 @@ class BatchedTraceProcessor(TraceProcessor):
         self.hashed_prog = [hash(op) for op in prog]
         self.opidx = -1
 
+    def reset(self):
+        self.batch = []
+
     def process_operation(self, op: Operation):
         self.opidx += 1
         self.batch.append(op)
@@ -664,6 +668,12 @@ class RollingKGramHasher:
         self.idx = 0
         self.seen = 0
 
+    def reset(self):
+        self.state = self.HasherState.INIT
+        self.curhash = 0
+        self.idx = 0
+        self.seen = 0
+
     def add_hash(self, hashval):
         if self.state == self.HasherState.INIT:
             self.buf[self.idx] = hashval
@@ -698,7 +708,7 @@ class Winnower:
         self.w = t - k + 1
         assert(self.w > 0)
         # Circular buffer holding the windows.
-        self.h = [0] * self.w
+        self.h = [None] * self.w
         self.r = 0
         self.min = 0
 
@@ -782,6 +792,9 @@ class Winnower:
 
     def reset(self):
         self.watches = {}
+        self.r = 0
+        self.min = 0
+        self.hasher.reset()
 
 
 class WinnowingTraceProcessor(TraceProcessor):
@@ -854,6 +867,10 @@ class WinnowingBatchedTraceProcessor(TraceProcessor):
                 to_return.append(trace)
             return to_return
         return None
+
+    def reset(self):
+        self.batch = []
+        self.winnower.reset()
 
 
 # Another component of the trace cache architecture is a component that actually
@@ -1027,13 +1044,20 @@ class TraceTriePointer:
         self.depth += 1
         return True
 
-    def complete(self):
+    def complete(self, to_update=None):
         if self.node.is_end and self.opidx >= self.node.opidx:
             self.node.num_visits += 1
+            if to_update is not None:
+                to_update[tuple(self.tokens)] += 1
             if self.threshold is not None and self.node.num_visits >= self.threshold:
                 assert(len(self.tokens) == self.depth)
                 return self.tokens, self.opidx
         return None
+
+    # Higher score means better to pick this node.
+    def score(self) -> int:
+        # Plus 1 to ensure that we don't get owndd by the zero.
+        return (self.node.num_visits + 1) * self.depth
 
 
 
@@ -1058,11 +1082,18 @@ class TraceOccurrenceWatcher:
         self.active_pointers = []
         self.threshold = threshold
         self.count = 0
+        self.trace_counts = {}
+
+    def reset(self):
+        self.trie = Trie()
+        self.active_pointers = []
+        self.count = 0
 
     def insert(self, trace, opidx):
         assert(len(trace) >= TRACE_MIN_LENGTH)
         self.trie.insert(trace, opidx)
         self.count += 1
+        self.trace_counts[tuple(trace)] = 0
 
     def remove(self, trace):
         # TODO (rohany): The remove call here isn't checking that the string actually
@@ -1079,7 +1110,7 @@ class TraceOccurrenceWatcher:
             if not pointer.advance(token):
                 continue
             new_pointers.append(pointer)
-            completed = pointer.complete()
+            completed = pointer.complete(to_update=self.trace_counts)
             if completed is not None:
                 thresholded.append(completed)
         self.active_pointers = new_pointers
@@ -1158,7 +1189,10 @@ class TraceReplayTrieWatcher:
         self.active_watchers.append(TraceTriePointer(self.trie.root, opidx, threshold=0))
 
         advanced_pointers = []
-        completed_pointers = []
+        # TODO (rohany): We're accidentally throwing away completed pointers here?
+        #  This should be self.completed_watchers...
+        # completed_pointers = []
+        completed_pointers = self.completed_watchers
         for pointer in self.active_watchers:
             if pointer.advance(token):
                 # Depending on if the pointer is complete, add it to the right list.
@@ -1190,7 +1224,7 @@ class TraceReplayTrieWatcher:
             # to try and issue the largest traces possible. There are potentially other
             # kinds of orderings that could be done here, like a binpack of the depths
             # and starting indices, but I don't think this situation should arise that often anyway?
-            sorted_completions = reversed(sorted(completed_pointers, key=lambda pointer: pointer.depth))
+            sorted_completions = reversed(sorted(completed_pointers, key=lambda pointer: pointer.score()))
             for completed in sorted_completions:
                 if completed.opidx < self.op_buf_start_idx:
                     continue
@@ -1222,13 +1256,14 @@ class TraceReplayTrieWatcher:
                 #  If this is done, the `completed_pointers` list needs to be updated without
                 #  a slice but instead a full filter about everything that is no longer valid.
                 #  We also have to make sure that whatever is chosen is before the cutoff point.
-                sorted_completions = sorted(completed_pointers, key=lambda pointer: (-pointer.node.num_visits, pointer.opidx))
+                sorted_completions = reversed(sorted(completed_pointers, key=lambda pointer: pointer.score()))
                 # sorted_completions = sorted(completed_pointers, key=lambda pointer: pointer.opidx)
                 cutoff_opidx = earliest_active
                 new_completions = []
                 for completed in sorted_completions:
                     if completed.opidx >= cutoff_opidx:
                         new_completions.append(completed)
+                        continue
                     if completed.opidx < self.op_buf_start_idx:
                         continue
                     self._flush_buffer(completed.opidx)
@@ -1281,9 +1316,333 @@ class TraceReplayTrieWatcher:
         self.op_buf_start_idx += real_index
 
 
+class StableTraceReplayTrieWatcher(TraceReplayTrieWatcher):
+
+    # Variant/Copy of the original TraceTriePointer
+    class Pointer:
+        def __init__(self, node: TrieNode, opidx: int):
+            self.node = node
+            self.opidx = opidx
+            self.depth = 0
+
+        def advance(self, token) -> bool:
+            # Importantly, we can't check node.is_end here, because if
+            # a trie node is a prefix of another string in the trie, we'd
+            # break off here when we should keep searching.
+            if token not in self.node.children:
+                return False
+            self.node = self.node.children[token]
+            self.depth += 1
+            return True
+
+        def complete(self):
+            return self.node.is_end and self.opidx >= self.node.opidx
+
+        def replay(self):
+            self.node.num_visits += 1
+
+        # Higher score means better to pick this node.
+        def score(self) -> int:
+            # Plus 1 to ensure that we don't get owndd by the zero.
+            return (self.node.num_visits + 1) * self.depth
 
 
-def main(filename, winnowed):
+
+    # Mostly copied, but partially overridden method from the parent class.
+    def process_operation(self, token, opidx):
+        self.op_buffer.append(token)
+        self.active_watchers.append(self.Pointer(self.trie.root, opidx))
+
+        advanced_pointers = []
+        completed_pointers = self.completed_watchers
+        for pointer in self.active_watchers:
+            if pointer.advance(token):
+                # Depending on if the pointer is complete, add it to the right list.
+                # Different logic will need to be used if we want to support prefixes.
+                if pointer.complete():
+                    completed_pointers.append(pointer)
+                else:
+                    advanced_pointers.append(pointer)
+
+
+        earliest_active = min([pointer.opidx for pointer in advanced_pointers], default=None)
+        earliest_completed = min([pointer.opidx for pointer in completed_pointers], default=None)
+        earliest_opidx = min([pointer.opidx for pointer in itertools.chain(advanced_pointers, completed_pointers)], default=None)
+
+        # No matter what, we can flush all operations before the earliest active or completed pointer.
+        # Note that if there are no active pointers or completed pointers, min will be None, flushing
+        # the entire buffer. This will change if we want to support prefixes.
+        self._flush_buffer(earliest_opidx)
+        if earliest_active is None and earliest_completed is None:
+            # If we have no active or completed pointers, then there isn't
+            # anything left to do.
+            pass
+        elif earliest_active is None:
+            # In this case, we only have completed pointers and no active pointers.
+            # So, flush through as many completed operations as we can. This is heuristic
+            # to try and issue the largest traces possible. There are potentially other
+            # kinds of orderings that could be done here, like a binpack of the depths
+            # and starting indices, but I don't think this situation should arise that often anyway?
+            sorted_completions = reversed(sorted(completed_pointers, key=lambda pointer: pointer.score()))
+            for completed in sorted_completions:
+                if completed.opidx < self.op_buf_start_idx:
+                    continue
+                self._flush_buffer(completed.opidx)
+                completed.replay()
+                print(f"1 ISSUING TRACE OF LENGTH {completed.depth} recorded at opidx {completed.node.opidx}, issuing at {opidx}")
+                self._flush_buffer(completed.opidx + completed.depth)
+
+            # At this point we've issued all of the possible completed pointers, with no active
+            # pointers left in the trie, so issue the rest of the buffer now.
+            self._flush_buffer()
+            completed_pointers = []
+        elif earliest_completed is None:
+            # There are no completed pointers, so all there's left to do issue everything
+            # that is unmatched now. We can do this by finding the smallest active opidx
+            # and flushing the buffer until then. This was also done outside of this case above.
+            ...
+        else:
+            # In this case, we have some active pointers and some completed pointers. In this case,
+            # we're going to take a different heuristic than the base TraceReplayTrieWatcher where
+            # we're only going to flush completed pointers that do not overlap with any active pointers.
+            # TODO (rohany): The stable trace replay watcher can only increment the visit count of its
+            #  trie nodes when they are flushed, not when they are just completed. We probably need to
+            #  just write a different visit class for this instead of trying to co-opt the one again.
+            if earliest_completed < earliest_active:
+                sorted_completions = reversed(sorted(completed_pointers, key=lambda pointer: (pointer.score(), -pointer.opidx)))
+                cutoff_opidx = earliest_active
+                new_completions = []
+                for completed in sorted_completions:
+                    # TODO (rohany): I think that this should be > not >=, but need to test further.
+                    if completed.opidx + completed.depth >= cutoff_opidx:
+                        new_completions.append(completed)
+                        continue
+                    if completed.opidx < self.op_buf_start_idx:
+                        continue
+                    self._flush_buffer(completed.opidx)
+                    completed.replay()
+                    print(f"2 ISSUING TRACE OF LENGTH {completed.depth} recorded at opidx {completed.node.opidx}, issuing at {opidx}")
+                    self._flush_buffer(completed.opidx + completed.depth)
+                completed_pointers = new_completions
+
+                # Since we waited to not cutoff any active pointers, there should not be any invalid active pointers.
+                # Let's assert this to be safe.
+                for pointer in advanced_pointers:
+                    assert(pointer.opidx >= self.op_buf_start_idx)
+            elif earliest_completed > earliest_active:
+                # There are active pointers behind our completed pointers, so there's no point in even looking at anything.
+                ...
+            else:
+                assert(False)
+
+        self.active_watchers = advanced_pointers
+        self.completed_watchers = completed_pointers
+        # print(len(self.completed_watchers))
+
+
+def autotrace_state_machine(winnowed, state):
+    def p(s, node):
+        print(node.num_visits, s[:10], len(s), node.opidx)
+
+    class MachineState(Enum):
+        SEARCHING = 0
+        # TODO (rohany): There's a way to potentially simplify this
+        #  where we get rid of the watching state, and only have the
+        #  REPLAYING state, and just treat "waiting for enough visits"
+        #  to be the first "tier" of the JIT.
+        WATCHING = 1
+        REPLAYING = 2
+
+    to_add = 20
+    # TODO (rohany): Make the search width a command line parameter.
+    # It looks like the winnowing batched processor is strictly better than the
+    # winnowing-only processor.
+    if winnowed:
+        searcher = WinnowingBatchedTraceProcessor(300)
+    else:
+        searcher = BatchedTraceProcessor(state.prog, 300)
+
+    # Low visit thresholds (like 5) seem to result in traces we don't actually care about
+    # getting comitted.
+    visit_threshold = 15
+    watcher = TraceOccurrenceWatcher(threshold=visit_threshold)
+
+    # MachineState.WATCHING variables.
+    watching_count = 0
+    watching_longest_added = 0
+    watching_last_best = 0
+    # End MachineState.WATCHING variables.
+
+    replayer = TraceReplayTrieWatcher()
+
+    # Initial state is "searching".
+    jitstate = MachineState.SEARCHING
+    for opidx, op in enumerate(state.prog):
+        if jitstate == MachineState.SEARCHING:
+            traces = searcher.process_operation(op)
+            if traces is None:
+                # We haven't found any traces yet, so we stay in the searching state.
+                jitstate = MachineState.SEARCHING
+            else:
+                print("GOT SOME TRACES", opidx)
+                # We found some traces, so add them to the set of watched traces.
+                # TODO (rohany): I'm assuming that we're not trying to have
+                #  multiple of these stages happening simulatenously.
+                count = 0
+                for trace in [[hash(op) for op in trace] for trace in traces]:
+                    if len(trace) < TRACE_MIN_LENGTH:
+                        continue
+                    assert (len(trace) >= TRACE_MIN_LENGTH)
+                    # if not watcher.trie.prefix(trace) and not watcher.trie.superstring(trace):
+                    if not watcher.trie.prefix(trace):
+                        watcher.insert(trace, opidx)
+                        watching_longest_added = max(watching_longest_added, len(trace))
+                        count += 1
+                        if count == to_add:
+                            break
+                searcher.reset()
+                jitstate = MachineState.WATCHING
+        elif jitstate == MachineState.WATCHING:
+            traces = watcher.process_operation(hash(op), opidx)
+            watching_count += 1
+            if len(traces) == 0:
+                # TODO (rohany): Need to have a fraction here to go back to searching
+                #  if we don't upgrade any traces to commit in a *reasonable* amount of time.
+                # TODO (rohany): Well how should we do this? If we decide to watch some traces
+                #  and none of them get executed a fixed number of times, then we should bail on
+                #  this batch. If the maximum length trace is of length N and we wait for (arbitrarily)
+                #  5N operations without seeing at least an improvement of (arbitrarily) 3 since last time,
+                #  then we've picked the traces badly and should try again.
+                # TODO (rohany): I think that we should be in a "mixed" state where we are always watching
+                #  potential candidates and replaying traces, and watched traces can be upgraded into replayable
+                #  traces when they are caught enough. However, if we decide to do this, then we've basically
+                #  just become the merged / tiered stage. Doing this in a single replay data structure is the
+                #  problem of counting a single token towards multiple traces or not. Counting towards multiple
+                #  traces is nice because we can then get a 100% accurate reading of what traces are being
+                #  issued by the application. The problem however is that this is not reality -- two traces can
+                #  hit the threshold but be partially overlapping. If we comitted both of them, then we'd never
+                #  actually get to replay them both. If we use the "one-token-used-once" behavior of the replayer,
+                #  then we would see what traces are actually getting used. The problem is now that a sane implementation
+                #  of the tracker needs to encode some kind of heuristics about what traces to choose when given a prefix
+                #  so far (i.e. should it wait to see more and potentially match a longer trace or commit to something).
+                #  When succumbing to a heuristic like this, we might not get accurate counts of traces seen in the program.
+                #  However, with watching being in the same state as replaying, what could happen, and what was
+                #  happening before, is that we could be happily replaying trace A, and then decide that hey, it's time
+                #  to commit a new trace B which ends in a prefix of A. Then we'd all of a sudden stop replaying A and
+                #  switch over to B which is not going to be the right choice. This won't happen in steady state if we
+                #  treat watched traces in the replayable data structure, because the set of watched traces will
+                #  hit a steady state with one another, but a newly inserted trace could lead to a problem.
+                # TODO (rohany): I think that I want to just go ahead and make an implementation of the trace trie
+                #  replay watcher that can handle the waiting? This is all very hazy, but I want to discuss it with Mike.
+                # SOOO -- Questions / discussion points for mike:
+                #  1) state machine versus always-on approach
+                #  2) how to handle tiering? one-at-atime or precise approach?
+                #  3) trace selection issue -- complexity of it tradeoff versus some unpredictable behavior
+                #     * could lead to bad behavior with chains of traces picked, AB; BC; CD; DE ... Could wait a long time!
+                #  4) Some of this complexity goes away if we just consider one  active trace at a time. Is this too restrictive?
+                jitstate = MachineState.WATCHING
+                if watching_count >= 5 * watching_longest_added:
+                    best = 0
+                    for _, v in watcher.trace_counts.items():
+                        best = max(best, v)
+                    if best - watching_last_best < 3:
+                        print("GOING BACK TO SEARCHING")
+                        # Jump back to searching.
+                        jitstate = MachineState.SEARCHING
+                        watching_count = 0
+                        watching_last_best = 0
+                        watching_longest_added = 0
+                    else:
+                        # Stay in the watching state.
+                        jitstate = MachineState.WATCHING
+                        watching_count = 0
+            else:
+                # TODO (rohany): This is right now structured to escalate a single trace
+                #  trace from the watched to committed tries. It's not built right now to
+                #  do multiple.
+                print("UPDATING TRACES TO COMMITTING", opidx)
+                for trace, idx in traces:
+                    if not (replayer.trie.prefix(trace) or replayer.trie.superstring(trace)):
+                        replayer.insert(trace, idx)
+                watcher.reset()
+                jitstate = MachineState.REPLAYING
+        elif jitstate == MachineState.REPLAYING:
+            # TODO (rohany): Need to have a heuristic drop us out of the
+            #  replaying state if we aren't replaying enough operations.
+            replayer.process_operation(hash(op), opidx)
+            jitstate = MachineState.REPLAYING
+        else:
+            assert False
+
+
+    # assert (committed.op_buf_start_idx + len(committed.op_buffer) == len(state.prog))
+
+
+def autotrace_always_on(winnowed, state, batchsize):
+    def p(s, node):
+        print(node.num_visits, s[:10], len(s), node.opidx)
+
+    to_add = 10
+    # to_remove = 5
+    # Low visit thresholds (like 5) seem to result in traces we don't actually care about
+    # getting comitted.
+    visit_threshold = 15
+    maximum_watching = 25
+
+    # It looks like the winnowing batched processor is strictly better than the
+    # winnowing-only processor.
+    if winnowed:
+        processor = WinnowingBatchedTraceProcessor(batchsize)
+    else:
+        processor = BatchedTraceProcessor(state.prog, batchsize)
+
+    watcher = TraceOccurrenceWatcher(threshold=visit_threshold)
+    # committed = TraceReplayTrieWatcher()
+    committed = StableTraceReplayTrieWatcher()
+    for opidx, op in enumerate(state.prog):
+        for trace, idx in watcher.process_operation(hash(op), opidx):
+            assert(len(trace) >= TRACE_MIN_LENGTH)
+            # TODO (rohany): I haven't yet thought of the cleanest way to check this, but I also
+            #  don't want to insert something if it is a superstring of a trace that
+            #  is already in the tree, because then we have a prefix situation?
+            # if not (committed.trie.prefix(trace) or committed.trie.superstring(trace)):
+            if not committed.trie.prefix(trace):
+                committed.insert(trace, idx)
+        committed.process_operation(hash(op), opidx)
+
+        traces = processor.process_operation(op)
+        if traces is not None:
+            if watcher.count + to_add > maximum_watching:
+                # Remove potential traces with the fewest number of visits.
+                all_traces = []
+                def add_trace(s, node):
+                    all_traces.append((s, node.num_visits))
+                watcher.trie.foreach_string(add_trace)
+                for trace, _ in sorted(all_traces, key=lambda x: x[1])[:(watcher.count + to_add - maximum_watching)]:
+                    watcher.remove(trace)
+
+            # TODO (rohany): Insertions should go before the deletions ... Though I guess I did
+            #  this originally so that we wouldn't just delete the things we add immediately because
+            #  they have 0 count?
+            count = 0
+            for trace in [[hash(op) for op in trace] for trace in traces]:
+                if len(trace) < TRACE_MIN_LENGTH:
+                    continue
+                assert (len(trace) >= TRACE_MIN_LENGTH)
+                # if not watcher.trie.prefix(trace) and not watcher.trie.superstring(trace):
+                if not watcher.trie.prefix(trace):
+                    watcher.insert(trace, opidx)
+                    count += 1
+                    if count == to_add:
+                        break
+
+    print("Final committed traces:")
+    committed.trie.foreach_string(p)
+
+    assert (committed.op_buf_start_idx + len(committed.op_buffer) == len(state.prog))
+
+
+def main(filename, winnowed, state_machine, batchsize):
 
     # winnower = Winnower(10, 4)
     # for tok in "adorunrunrunadorunrun":
@@ -1325,21 +1684,6 @@ def main(filename, winnowed):
     # # watcher.trie.foreach_string(p)
     # exit(0)
 
-
-    print("Loading file...")
-    with open(filename, 'r') as f:
-        state = parse_spy_log(f)
-    state.prune_ops()
-    print(f"Loaded Legion Spy log, {len(state.prog)} ops")
-
-    S = [hash(op) for op in state.prog]
-
-    # We can change this execution model here to maintain buffers etc like what
-    # I might implement in the runtime system.
-
-    def p(s, node):
-        print(node.num_visits, s[:10], len(s), node.opidx)
-
     # TODO (rohany): What are the actual interfaces that I want to expose here?
     #  1) TraceProcessor -- a component that processes a stream an operation at a time,
     #     and maybe returns a list of traces to start considering.
@@ -1349,63 +1693,18 @@ def main(filename, winnowed):
     #     TraceWatcher and tracks how many times they have been hit by the application,
     #     essentially seeing the results of the decisions we have made.
 
-    to_add = 10
-    # to_remove = 5
-    # Low visit thresholds (like 5) seem to result in traces we don't actually care about
-    # getting comitted.
-    visit_threshold = 15
-    maximum_watching = 25
+    print("Loading file...")
+    with open(filename, 'r') as f:
+        state = parse_spy_log(f)
+    state.prune_ops()
+    print(f"Loaded Legion Spy log, {len(state.prog)} ops")
 
-    # It looks like the winnowing batched processor is strictly better than the
-    # winnowing-only processor.
-    if winnowed:
-        processor = WinnowingBatchedTraceProcessor(300)
+    if state_machine:
+        autotrace_state_machine(winnowed, state)
     else:
-        processor = BatchedTraceProcessor(state.prog, 300)
+        autotrace_always_on(winnowed, state, batchsize)
 
-    watcher = TraceOccurrenceWatcher(threshold=visit_threshold)
-    committed = TraceReplayTrieWatcher()
-    for opidx, op in enumerate(state.prog):
-        for trace, idx in watcher.process_operation(hash(op), opidx):
-            assert(len(trace) >= TRACE_MIN_LENGTH)
-            # TODO (rohany): I haven't yet thought of the cleanest way to check this, but I also
-            #  don't want to insert something if it is a superstring of a trace that
-            #  is already in the tree, because then we have a prefix situation?
-            # if not committed.trie.prefix(trace) and not committed.trie.superstring(trace):
-            if not committed.trie.prefix(trace):
-                committed.insert(trace, idx)
-        committed.process_operation(hash(op), opidx)
 
-        traces = processor.process_operation(op)
-        if traces is not None:
-            if watcher.count + to_add > maximum_watching:
-                # Remove potential traces with the fewest number of visits.
-                all_traces = []
-                def add_trace(s, node):
-                    all_traces.append((s, node.num_visits))
-                watcher.trie.foreach_string(add_trace)
-                for trace, _ in sorted(all_traces, key=lambda x: x[1])[:(watcher.count + to_add - maximum_watching)]:
-                    watcher.remove(trace)
-
-            # TODO (rohany): Insertions should go before the deletions ... Though I guess I did
-            #  this originally so that we wouldn't just delete the things we add immediately because
-            #  they have 0 count?
-            count = 0
-            for trace in [[hash(op) for op in trace] for trace in traces]:
-                if len(trace) < TRACE_MIN_LENGTH:
-                    continue
-                assert (len(trace) >= TRACE_MIN_LENGTH)
-                # if not watcher.trie.prefix(trace) and not watcher.trie.superstring(trace):
-                if not watcher.trie.prefix(trace):
-                    watcher.insert(trace, opidx)
-                    count += 1
-                    if count == to_add:
-                        break
-
-    print("Final committed traces:")
-    committed.trie.foreach_string(p)
-
-    assert (committed.op_buf_start_idx + len(committed.op_buffer) == len(state.prog))
     # print("Final watcher traces:")
     # watcher.trie.foreach_string(p)
 
@@ -1471,6 +1770,8 @@ def main(filename, winnowed):
 parser = argparse.ArgumentParser()
 parser.add_argument("filename", type=str)
 parser.add_argument("--winnowed", default=False, action="store_true")
+parser.add_argument("--state_machine", default=False, action="store_true")
+parser.add_argument("--batchsize", default=300, type=int)
 args = parser.parse_args()
 
 if __name__ == "__main__":
