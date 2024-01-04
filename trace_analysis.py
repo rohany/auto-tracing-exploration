@@ -4,16 +4,20 @@ import argparse
 from collections import deque
 import copy
 import ctypes
+from enum import Enum
 import itertools
 import os
 import re
+import sys
 import time
 
-from enum import Enum
+from intervaltree import IntervalTree
 from suffix_tree import Tree
 from suffix_tree.node import Node, Internal, Leaf
 
 from typing import Sequence, Hashable
+
+sys.setrecursionlimit(15000)
 
 prefix = "\[(?P<node>[0-9]+) - (?P<thread>[0-9a-f]+)\](?:\s+[0-9]+\.[0-9]+)? \{\w+\}\{legion_spy\}: "
 index_task_pat = re.compile(
@@ -32,7 +36,8 @@ op_provenance_pat        = re.compile(
     prefix+"Operation Provenance (?P<uid>[0-9]+) (?P<provenance>.*)")
 
 
-TRACE_MIN_LENGTH = 3
+TRACE_MIN_LENGTH = 10
+# TRACE_MAX_LENGTH = 2000
 
 class LegionObject:
     def __init__(self, uid):
@@ -529,6 +534,9 @@ def longest_nonoverlapping_repeats(program):
     def finder(node):
         if isinstance(node, Internal) and node != tree.root:
             strlen = node.end - node.start
+            # if strlen < TRACE_MIN_LENGTH or strlen >= TRACE_MAX_LENGTH:
+            if strlen < TRACE_MIN_LENGTH:
+                return
             if node.imin + strlen <= node.imax:
                 repeats.append(node)
                 # For each of the leaves rooted at this subtree, figure out how many
@@ -545,7 +553,50 @@ def longest_nonoverlapping_repeats(program):
     tree.pre_order(finder)
 
     # This ordering heuristic is approximating tandem repeats?
-    return list(reversed(sorted(repeats, key=lambda x: ((x.end - x.start) * x.num_repeats, x.num_repeats))))
+    result = list(reversed(sorted(repeats, key=lambda x: ((x.end - x.start) * x.num_repeats, x.num_repeats))))
+
+    # tree = IntervalTree()
+    # new_result = []
+    # for x in result:
+    #     # The interval tree doesn't yet precisely have interval containment, just
+    #     # overlap. We'll start with overlap to get the point across
+    #     if tree.overlaps(x.start, x.end):
+    #         continue
+    #     new_result.append(x)
+    #     tree.addi(x.start, x.end)
+    # result = new_result
+
+    def startswith(l1, l2):
+        for i1, i2 in zip(l1, l2):
+            if i1 != i2:
+                return False
+        return True
+
+    def anyprefix(l, ls):
+        for l2 in ls:
+            if startswith(l, l2):
+                return True
+        return False
+
+    # Doing this appears to be good for torchswe, but not good for other applications?
+    ends = set()
+    new_result = []
+    for x in result:
+        # The interval tree doesn't yet precisely have interval containment, just
+        # overlap. We'll start with overlap to get the point across
+        if x.end in ends:
+            continue
+        # if anyprefix(program[x.start:x.end], [program[y.start:y.end] for y in new_result]):
+        #     continue
+        new_result.append(x)
+        ends.add(x.end)
+    result = new_result
+
+    # print("NEW RESULTS!")
+    # for x in result:
+    #     print(x.end - x.start, x.start, x.end, x.num_repeats, (x.end - x.start) * x.num_repeats)
+
+    return result
 
 
 class RepeatAlgorithms(Enum):
@@ -1181,6 +1232,7 @@ class TraceReplayTrieWatcher:
         self.active_watchers = []
         self.completed_watchers = []
         self.trie = Trie()
+        self.traced_ops = 0
 
     def process_operation(self, token, opidx):
         self.op_buffer.append(token)
@@ -1229,8 +1281,8 @@ class TraceReplayTrieWatcher:
                 if completed.opidx < self.op_buf_start_idx:
                     continue
                 self._flush_buffer(completed.opidx)
-                print(f"1 ISSUING TRACE OF LENGTH {completed.depth} recorded at opidx {completed.node.opidx}, issuing at {opidx}")
-                self._flush_buffer(completed.opidx + completed.depth)
+                print(f"1 ISSUING TRACE OF LENGTH {completed.depth} recorded at opidx {completed.node.opidx}, issuing at {completed.opidx}")
+                self._flush_buffer(completed.opidx + completed.depth, trace=True)
 
             # At this point we've issued all of the possible completed pointers, with no active
             # pointers left in the trie, so issue the rest of the buffer now.
@@ -1267,8 +1319,8 @@ class TraceReplayTrieWatcher:
                     if completed.opidx < self.op_buf_start_idx:
                         continue
                     self._flush_buffer(completed.opidx)
-                    print(f"2 ISSUING TRACE OF LENGTH {completed.depth} recorded at opidx {completed.node.opidx}, issuing at {opidx}")
-                    self._flush_buffer(completed.opidx + completed.depth)
+                    print(f"2 ISSUING TRACE OF LENGTH {completed.depth} recorded at opidx {completed.node.opidx}, issuing at {completed.opidx}")
+                    self._flush_buffer(completed.opidx + completed.depth, trace=True)
                 completed_pointers = new_completions
 
                 # cutoff_opidx = earliest_active
@@ -1304,14 +1356,18 @@ class TraceReplayTrieWatcher:
 
     # TODO (rohany): We won't worry about removals for now.
 
-    def _flush_buffer(self, opidx=None):
+    def _flush_buffer(self, opidx=None, trace=False):
         if opidx is None:
             self.op_buf_start_idx += len(self.op_buffer)
+            if trace:
+                self.traced_ops += len(self.op_buffer)
             self.op_buffer = []
             return
         if self.op_buf_start_idx > opidx:
             return
         real_index = opidx - self.op_buf_start_idx
+        if trace:
+            self.traced_ops += real_index
         self.op_buffer = self.op_buffer[real_index:]
         self.op_buf_start_idx += real_index
 
@@ -1344,7 +1400,9 @@ class StableTraceReplayTrieWatcher(TraceReplayTrieWatcher):
         # Higher score means better to pick this node.
         def score(self) -> int:
             # Plus 1 to ensure that we don't get owndd by the zero.
-            return (self.node.num_visits + 1) * self.depth
+            # return (self.node.num_visits + 1) * self.depth
+            # TODO (rohany): This doesn't let us do any exploration towards larger traces?
+            return self.depth
 
 
 
@@ -1389,8 +1447,8 @@ class StableTraceReplayTrieWatcher(TraceReplayTrieWatcher):
                     continue
                 self._flush_buffer(completed.opidx)
                 completed.replay()
-                print(f"1 ISSUING TRACE OF LENGTH {completed.depth} recorded at opidx {completed.node.opidx}, issuing at {opidx}")
-                self._flush_buffer(completed.opidx + completed.depth)
+                print(f"1 ISSUING TRACE OF LENGTH {completed.depth} recorded at opidx {completed.node.opidx}, issuing at {completed.opidx}")
+                self._flush_buffer(completed.opidx + completed.depth, trace=True)
 
             # At this point we've issued all of the possible completed pointers, with no active
             # pointers left in the trie, so issue the rest of the buffer now.
@@ -1421,8 +1479,8 @@ class StableTraceReplayTrieWatcher(TraceReplayTrieWatcher):
                         continue
                     self._flush_buffer(completed.opidx)
                     completed.replay()
-                    print(f"2 ISSUING TRACE OF LENGTH {completed.depth} recorded at opidx {completed.node.opidx}, issuing at {opidx}")
-                    self._flush_buffer(completed.opidx + completed.depth)
+                    print(f"2 ISSUING TRACE OF LENGTH {completed.depth} recorded at opidx {completed.node.opidx}, issuing at {completed.opidx}")
+                    self._flush_buffer(completed.opidx + completed.depth, trace=True)
                 completed_pointers = new_completions
 
                 # Since we waited to not cutoff any active pointers, there should not be any invalid active pointers.
@@ -1580,14 +1638,20 @@ def autotrace_state_machine(winnowed, state):
 
 def autotrace_always_on(winnowed, state, batchsize):
     def p(s, node):
-        print(node.num_visits, s[:10], len(s), node.opidx)
+        # print(node.num_visits, s[:10], len(s), node.opidx)
+        print(node.num_visits, len(s), node.opidx)
 
-    to_add = 10
+
     # to_remove = 5
     # Low visit thresholds (like 5) seem to result in traces we don't actually care about
     # getting comitted.
-    visit_threshold = 15
-    maximum_watching = 25
+    visit_threshold = 10
+    # There's some unfortunate connections between to_add and maximum watching where traces that
+    # we actually want to be replaying don't get entirely recorded...
+    to_add = 10
+    maximum_watching = 100
+    # to_add = 30
+    # maximum_watching = 60
 
     # It looks like the winnowing batched processor is strictly better than the
     # winnowing-only processor.
@@ -1636,8 +1700,11 @@ def autotrace_always_on(winnowed, state, batchsize):
                     if count == to_add:
                         break
 
-    print("Final committed traces:")
-    committed.trie.foreach_string(p)
+    print(committed.traced_ops, len(state.prog), committed.traced_ops / (len(state.prog)))
+    # print("Final committed traces:")
+    # committed.trie.foreach_string(p)
+    # print("Final watched traces:")
+    # watcher.trie.foreach_string(p)
 
     assert (committed.op_buf_start_idx + len(committed.op_buffer) == len(state.prog))
 
@@ -1698,6 +1765,29 @@ def main(filename, winnowed, state_machine, batchsize):
         state = parse_spy_log(f)
     state.prune_ops()
     print(f"Loaded Legion Spy log, {len(state.prog)} ops")
+
+    # trace = state.prog[1567:1567+118]
+    # for op in trace:
+    #     print(op, op.provenance)
+
+
+    # trace = state.prog[6848:6848+20]
+    # for op in trace:
+    #     print(op, op.provenance)
+    #
+    # print("")
+    #
+    # trace = state.prog[33639:33639+20]
+    # for op in trace:
+    #     print(op, op.provenance)
+    #
+    # print("")
+    # #
+    # # # trace = state.prog[14180:14180+34]
+    # # # for op in trace:
+    # # #     print(op, op.provenance)
+    # #
+    # exit(0)
 
     if state_machine:
         autotrace_state_machine(winnowed, state)
